@@ -194,6 +194,8 @@ private:
 
   void DumpTensorCodegen(const CallNode *op, const std::string &op_name);
 
+  void SrcCodeCodegen(const CallNode *op);
+
   void BroadcastOpCodegen(const CallNode *op);
 
   void SelectCodegen(const CallNode *op);
