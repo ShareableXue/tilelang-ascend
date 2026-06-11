@@ -7,7 +7,6 @@ import tilelang.language as T
 from tilelang.intrinsics import make_zn_layout, make_nz_layout
 
 # 初始化环境
-torch.set_default_device("npu")
 torch.manual_seed(0)
 tilelang.disable_cache()
 
@@ -172,8 +171,7 @@ def high_perf_mtgr_sparse_attn_kernel(
                             (_k > s_local) & (split_points[b_i, _k] < seg_end_offset), _k, next_seg_first_tile
                         )
                     tiles_this_batch = tiles_prefix_sum[b_i + 1] - tiles_prefix_sum[b_i]
-                    next_seg_first_tile = T.if_then_else(next_seg_first_tile == s_local, tiles_this_batch, next_seg_first_tile)
-                    kv_iter_end = T.if_then_else(rule == 1, next_seg_first_tile, s_local + 1)
+                    kv_iter_end = T.if_then_else(rule == 1, T.if_then_else(next_seg_first_tile > s_local, next_seg_first_tile + 1, tiles_this_batch), s_local + 1)
 
                     # 计算有效 K 切片数量（Cube 无法读写 UB，仅计数）
                     seg_start = segment_offsets[b_i, seg_id]
@@ -350,8 +348,7 @@ def high_perf_mtgr_sparse_attn_kernel(
                             (_k > s_local) & (split_points[b_i, _k] < seg_end_offset), _k, next_seg_first_tile
                         )
                     tiles_this_batch = tiles_prefix_sum[b_i + 1] - tiles_prefix_sum[b_i]
-                    next_seg_first_tile = T.if_then_else(next_seg_first_tile == s_local, tiles_this_batch, next_seg_first_tile)
-                    kv_iter_end = T.if_then_else(rule == 1, next_seg_first_tile, s_local + 1)
+                    kv_iter_end = T.if_then_else(rule == 1, T.if_then_else(next_seg_first_tile > s_local, next_seg_first_tile + 1, tiles_this_batch), s_local + 1)
 
                     valid_k_total = 0
                     for k_i in T.serial(kv_iter_end):
@@ -599,14 +596,14 @@ def high_perf_sparse_attn_wrapper(
         cross_interval=cross_interval
     )
 
-    print(func.get_kernel_source()) # 可以解除注释打印算子源码验证
+    # print(func.get_kernel_source()) # 可以解除注释打印算子源码验证
 
     func(
         query,
         key,
         value,
         output,
-        q_seq_starts_i32,
+        q_seq_starts_i32.to(query.device),
         split_points_i32,
         tiles_prefix_sum_i32,
         segment_offsets_padded_i32,
@@ -747,9 +744,9 @@ def test(
     k_list_live = []
     v_list_live = []
     for b in range(B):
-        q_b = torch.randn(actual_q_len_arr[b], H, D, dtype=torch.bfloat16)
-        k_b_full = torch.randn(S_logical_list[b], kv_heads, D, dtype=torch.bfloat16)
-        v_b_full = torch.randn(S_logical_list[b], kv_heads, D, dtype=torch.bfloat16)
+        q_b = torch.randn(actual_q_len_arr[b], H, D, dtype=torch.float32, device="cpu").to(torch.bfloat16)
+        k_b_full = torch.randn(S_logical_list[b], kv_heads, D, dtype=torch.float32, device="cpu").to(torch.bfloat16)
+        v_b_full = torch.randn(S_logical_list[b], kv_heads, D, dtype=torch.float32, device="cpu").to(torch.bfloat16)
         q_list.append(q_b)
         k_list_full.append(k_b_full)
         v_list_full.append(v_b_full)
@@ -763,8 +760,8 @@ def test(
     value_snd = torch.cat(v_list_live, dim=0)
 
     num_cache_blocks = sum((matched_prefix_arr[b] + block_size - 1) // block_size for b in range(B))
-    key_cache = torch.zeros(num_cache_blocks, block_size, kv_heads, D, dtype=torch.bfloat16)
-    value_cache = torch.zeros(num_cache_blocks, block_size, kv_heads, D, dtype=torch.bfloat16)
+    key_cache = torch.zeros(num_cache_blocks, block_size, kv_heads, D, dtype=torch.bfloat16, device="cpu")
+    value_cache = torch.zeros(num_cache_blocks, block_size, kv_heads, D, dtype=torch.bfloat16, device="cpu")
 
     block_table_arr = []
     physical_block_offset = 0
@@ -791,15 +788,15 @@ def test(
                 value_cache[physical_block, block_offset, :, :] = v_list_full[b][p, :, :]
 
     max_blocks_per_request = max(len(bt) for bt in block_table_arr)
-    block_table_tensor = torch.zeros(B, max_blocks_per_request, dtype=torch.int32)
+    block_table_tensor = torch.zeros(B, max_blocks_per_request, dtype=torch.int32, device="cpu")
     for b in range(B):
         for lb in range(len(block_table_arr[b])):
             block_table_tensor[b, lb] = block_table_arr[b][lb]
 
-    segment_offsets_i32 = torch.tensor(offsets_list, dtype=torch.int32)
-    segment_rules_i32 = torch.tensor(rules, dtype=torch.int32)
-    q_seq_starts_i32 = torch.tensor(q_seq_starts_arr, dtype=torch.int32)
-    matched_prefix_lens_i32 = torch.tensor(matched_prefix_arr, dtype=torch.int32)
+    segment_offsets_i32 = torch.tensor(offsets_list, dtype=torch.int32, device="cpu")
+    segment_rules_i32 = torch.tensor(rules, dtype=torch.int32, device="cpu")
+    q_seq_starts_i32 = torch.tensor(q_seq_starts_arr, dtype=torch.int32, device="cpu")
+    matched_prefix_lens_i32 = torch.tensor(matched_prefix_arr, dtype=torch.int32, device="cpu")
 
     sm_scale = 1.0 / math.sqrt(D)
 
@@ -807,9 +804,9 @@ def test(
     print("init successful!")
 
     output_snd = high_perf_sparse_attn_wrapper(
-        query_snd,
-        key_snd,
-        value_snd,
+        query_snd.npu(),
+        key_snd.npu(),
+        value_snd.npu(),
         segment_offsets_i32,
         segment_rules_i32,
         q_seq_starts_i32,
@@ -838,7 +835,7 @@ def test(
     )
 
     torch.npu.synchronize()
-    torch.testing.assert_close(ref_output, output_snd, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(ref_output.npu(), output_snd, rtol=1e-2, atol=1e-2)
     print("Test Passed!")
 
 
@@ -848,16 +845,16 @@ if __name__ == "__main__":
             "H": 8,
             "D": 128,
             "seg_lengths": [
-                [2200, 8, 200, 1024],
-                [1700, 8, 300, 1100],
-                [2440, 8, 200, 2048],
-                [1600, 8, 600, 1800],
-                [3300, 8, 200, 1300],
-                [1700, 8, 300, 2048],
-                [1780, 8, 300, 1024],
-                [2048, 8, 500, 1800],
+                [2200, 200, 1024],
+                [1700, 300, 1100],
+                [2440, 200, 2048],
+                [1600, 400, 1800],
+                [2200, 200, 1300],
+                [1700, 300, 2048],
+                [1680, 300, 1024],
+                [2048, 700, 1800],
             ],
-            "rules": [0, 1, 0, 2],
+            "rules": [1, 0, 2],
             "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
         },
     ]
