@@ -29,6 +29,7 @@ PASS_CONFIGS = {
 def high_perf_mtgr_sparse_attn_kernel(
     heads,
     dim,
+    num_blocks,
     kv_group=1,
     sm_scale=None,
     block_M=128,
@@ -46,6 +47,7 @@ def high_perf_mtgr_sparse_attn_kernel(
     batch = T.symbolic("batch")
     total_q = T.symbolic("total_q")
     total_seq_tiles = T.symbolic("total_seq_tiles")
+    max_blocks = T.symbolic("max_blocks_per_req")
 
     kv_heads = heads // kv_group
     half_M = block_M // 2
@@ -81,6 +83,10 @@ def high_perf_mtgr_sparse_attn_kernel(
         workspace_1: T.Tensor([core_num, num_stages, block_M, block_N], dtype),
         workspace_2: T.Tensor([core_num, num_stages, block_M, block_N], dtype),
         workspace_3: T.Tensor([core_num, num_stages, block_M, dim], dtype),
+        key_cache: T.Tensor([num_blocks, block_N, kv_heads, dim], dtype),
+        value_cache: T.Tensor([num_blocks, block_N, kv_heads, dim], dtype),
+        block_table: T.Tensor([batch, max_blocks], "int32"),
+        prefix_lens: T.Tensor([batch], "int32"),
         _dummy: T.Tensor([total_seq_tiles], "int32"),
     ):
         with T.Kernel(core_num, is_npu=True) as (cid, vid):
@@ -111,8 +117,7 @@ def high_perf_mtgr_sparse_attn_kernel(
             io_buf = T.alloc_ub([half_M, block_N], dtype)
             acc_s_half = T.alloc_ub([half_M, block_N], dtype)
             work_ub = T.alloc_ub([half_M, block_N], accum_dtype)
-            buf_2d = T.alloc_ub([half_M, block_N], accum_dtype) # mask_ub
-            # buf_2d = T.alloc_ub([half_M, block_N], accum_dtype)
+            buf_2d = T.alloc_ub([half_M, block_N], accum_dtype)
 
             # 用于存储平铺流水线的真实有效 k 索引
             valid_k_indices = T.alloc_ub([max_splits], "int32")
@@ -162,7 +167,11 @@ def high_perf_mtgr_sparse_attn_kernel(
                         seg_id = T.if_then_else(q_start >= segment_offsets[b_i, _seg + 1], _seg + 1, seg_id)
 
                     rule = segment_rules[seg_id]
-                    q_packed_start = q_seq_starts[b_i] + q_start
+                    prefix_len_b = prefix_lens[b_i]
+                    q_start_live = T.if_then_else(q_start >= prefix_len_b, q_start, prefix_len_b)
+                    q_tile_size_live = q_end - q_start_live
+                    q_tile_size_live = T.if_then_else(q_tile_size_live > 0, q_tile_size_live, 0)
+                    q_packed_start = q_seq_starts[b_i] + q_start_live - prefix_len_b
                     seg_end_offset = segment_offsets[b_i, seg_id + 1]
 
                     next_seg_first_tile = s_local
@@ -189,7 +198,7 @@ def high_perf_mtgr_sparse_attn_kernel(
                             valid_k_total += 1
 
                     # 载入 Q
-                    T.copy(Q[q_packed_start : q_packed_start + q_tile_size, h_i, :], q_l1[:, :])
+                    T.copy(Q[q_packed_start : q_packed_start + q_tile_size_live, h_i, :], q_l1[:, :])
                     T.barrier_all()
                     num_outer = T.ceildiv(valid_k_total, num_stages)
 
@@ -217,10 +226,23 @@ def high_perf_mtgr_sparse_attn_kernel(
                                 scan_count = T.if_then_else(process_cond_scan, scan_count + 1, scan_count)
                             kv_start = split_points[b_i, scan_k_idx]
                             kv_size = split_points[b_i, scan_k_idx + 1] - kv_start
-                            kv_packed_start = q_seq_starts[b_i] + kv_start
+                            prefix_len_b = prefix_lens[b_i]
 
                             T.wait_flag("MTE1", "MTE2", SIG_K_L1)
-                            T.copy(K[kv_packed_start : kv_packed_start + kv_size, h_kv, :], k_l1[:, :])
+                            if kv_start < prefix_len_b:
+                                cache_block_idx = kv_start // block_N
+                                physical_block = block_table[b_i, cache_block_idx]
+                                block_offset_start = kv_start % block_N
+                                T.copy(
+                                    key_cache[physical_block, block_offset_start : block_offset_start + kv_size, h_kv, :],
+                                    k_l1[:, :],
+                                )
+                            else:
+                                kv_packed_start = q_seq_starts[b_i] + kv_start - prefix_len_b
+                                T.copy(
+                                    K[kv_packed_start : kv_packed_start + kv_size, h_kv, :],
+                                    k_l1[:, :],
+                                )
                             T.set_flag("MTE2", "MTE1", SIG_K_L1)
 
                             T.wait_flag("M", "MTE1", SIG_L0AB + side)
@@ -265,10 +287,23 @@ def high_perf_mtgr_sparse_attn_kernel(
                                 scan_count = T.if_then_else(process_cond_scan, scan_count + 1, scan_count)
                             kv_start = split_points[b_i, scan_k_idx]
                             kv_size = split_points[b_i, scan_k_idx + 1] - kv_start
-                            kv_packed_start = q_seq_starts[b_i] + kv_start
+                            prefix_len_b = prefix_lens[b_i]
 
                             T.wait_flag("MTE1", "MTE2", SIG_V_L1)
-                            T.copy(V[kv_packed_start : kv_packed_start + kv_size, h_kv, :], v_l1[:, :])
+                            if kv_start < prefix_len_b:
+                                cache_block_idx = kv_start // block_N
+                                physical_block = block_table[b_i, cache_block_idx]
+                                block_offset_start = kv_start % block_N
+                                T.copy(
+                                    value_cache[physical_block, block_offset_start : block_offset_start + kv_size, h_kv, :],
+                                    v_l1[:, :],
+                                )
+                            else:
+                                kv_packed_start = q_seq_starts[b_i] + kv_start - prefix_len_b
+                                T.copy(
+                                    V[kv_packed_start : kv_packed_start + kv_size, h_kv, :],
+                                    v_l1[:, :],
+                                )
                             T.set_flag("MTE2", "MTE1", SIG_V_L1)
 
                             T.wait_flag("MTE1", "MTE2", SIG_P_L1)
@@ -339,7 +374,11 @@ def high_perf_mtgr_sparse_attn_kernel(
                         seg_id = T.if_then_else(q_start >= segment_offsets[b_i, _seg + 1], _seg + 1, seg_id)
 
                     rule = segment_rules[seg_id]
-                    q_packed_start = q_seq_starts[b_i] + q_start
+                    prefix_len_b = prefix_lens[b_i]
+                    q_start_live = T.if_then_else(q_start >= prefix_len_b, q_start, prefix_len_b)
+                    q_tile_size_live = q_end - q_start_live
+                    q_tile_size_live = T.if_then_else(q_tile_size_live > 0, q_tile_size_live, 0)
+                    q_packed_start = q_seq_starts[b_i] + q_start_live - prefix_len_b
                     seg_end_offset = segment_offsets[b_i, seg_id + 1]
 
                     next_seg_first_tile = s_local
@@ -481,9 +520,9 @@ def high_perf_mtgr_sparse_attn_kernel(
 
                     # 收尾与拷贝回 GM (支持不规则最后一块裁减)
                     valid_rows = T.if_then_else(
-                        q_tile_size >= (vid + 1) * half_M,
+                        q_tile_size_live >= (vid + 1) * half_M,
                         half_M,
-                        T.if_then_else(q_tile_size > vid * half_M, q_tile_size - vid * half_M, 0),
+                        T.if_then_else(q_tile_size_live > vid * half_M, q_tile_size_live - vid * half_M, 0),
                     )
 
                     h_i_out = (cid + core_index * core_num) % heads
@@ -522,6 +561,11 @@ def high_perf_sparse_attn_wrapper(
     segment_rules_i32,
     q_seq_starts_i32,
     sm_scale,
+    num_blocks,
+    key_cache,
+    value_cache,
+    block_table_i32,
+    matched_prefix_lens_i32,
     block_M=128,
     block_N=128,
     core_num=24,
@@ -580,11 +624,19 @@ def high_perf_sparse_attn_wrapper(
     output = torch.empty_like(query)
     dummy_tensor = torch.empty(total_seq_tiles, dtype=torch.int32, device=query.device)
 
+    prefix_list = matched_prefix_lens_i32.cpu().tolist()
+    for b_idx, plen in enumerate(prefix_list):
+        if plen % block_N != 0:
+            raise ValueError(
+                f"matched_prefix_lens[{b_idx}] = {plen} is not a multiple of block_N={block_N}"
+            )
+
     print("开始编译kernel")
     # 获得编译好的 JIT Kernel
     func = high_perf_mtgr_sparse_attn_kernel(
         heads=H,
         dim=D,
+        num_blocks=num_blocks,
         kv_group=kv_group,
         sm_scale=sm_scale,
         block_M=block_M,
@@ -596,7 +648,7 @@ def high_perf_sparse_attn_wrapper(
         cross_interval=cross_interval
     )
 
-    # print(func.get_kernel_source()) # 可以解除注释打印算子源码验证
+    print(func.get_kernel_source()) # 可以解除注释打印算子源码验证
 
     func(
         query,
@@ -611,6 +663,10 @@ def high_perf_sparse_attn_wrapper(
         ws1,
         ws2,
         ws3,
+        key_cache,
+        value_cache,
+        block_table_i32,
+        matched_prefix_lens_i32,
         dummy_tensor,
     )
 
@@ -671,31 +727,37 @@ def golden_attention(
         offsets = segment_offsets_i32[b].cpu().tolist()
         rules = segment_rules_i32.cpu().tolist()
 
-        logical_positions = prefix_len + torch.arange(q_len)
-        offsets_tensor = torch.tensor(offsets, dtype=torch.int32)
-        seg_ids = torch.searchsorted(offsets_tensor[1:], logical_positions, right=True)
+        live_offsets = [max(0, o - prefix_len) for o in offsets]
+        live_positions = torch.arange(q_len)
+        offsets_tensor = torch.tensor(live_offsets, dtype=torch.int32)
+        seg_ids = torch.searchsorted(offsets_tensor[1:], live_positions, right=True)
 
-        mask_b = torch.zeros(q_len, total_kv_len_b, dtype=torch.float32)
+        mask_b = torch.zeros(q_len, q_len, dtype=torch.float32)
         for seg_id_val in range(len(rules)):
             rule = rules[seg_id_val]
             q_indices = (seg_ids == seg_id_val).nonzero().squeeze(-1)
             if q_indices.numel() == 0:
                 continue
             if rule == 0:
-                k_range = torch.arange(total_kv_len_b)
-                causal_mask = k_range.unsqueeze(0) <= logical_positions[q_indices].unsqueeze(1)
+                k_range = torch.arange(q_len)
+                causal_mask = k_range.unsqueeze(0) <= live_positions[q_indices].unsqueeze(1)
                 mask_b[q_indices] = causal_mask.float()
             elif rule == 1:
-                end = offsets[seg_id_val + 1]
+                end = live_offsets[seg_id_val + 1]
                 mask_b[q_indices, :end] = 1.0
             elif rule == 2:
-                start = offsets[seg_id_val]
+                start = live_offsets[seg_id_val]
                 mask_b[q_indices, :start] = 1.0
-                mask_b[q_indices, logical_positions[q_indices]] = 1.0
+                mask_b[q_indices, live_positions[q_indices]] = 1.0
+
+        full_mask = torch.zeros(q_len, total_kv_len_b, dtype=torch.float32)
+        if prefix_len > 0:
+            full_mask[:, :prefix_len] = 1.0
+        full_mask[:, prefix_len:] = mask_b
 
         scores = torch.einsum("qhd,khd->hqk", q_b, k_full_b) * sm_scale
         scores = scores.masked_fill(
-            mask_b.unsqueeze(0) == 0.0,
+            full_mask.unsqueeze(0) == 0.0,
             float("-inf"),
         )
         probs = torch.softmax(scores, dim=-1).nan_to_num(0.0)
@@ -721,6 +783,7 @@ def test(
 ):
     B = len(seg_lengths)
     kv_heads = H // kv_group
+    assert block_size == block_N
 
     S_logical_list = [sum(sl) for sl in seg_lengths]
 
@@ -759,7 +822,7 @@ def test(
     key_snd = torch.cat(k_list_live, dim=0)
     value_snd = torch.cat(v_list_live, dim=0)
 
-    num_cache_blocks = sum((matched_prefix_arr[b] + block_size - 1) // block_size for b in range(B))
+    num_cache_blocks = max(1, sum((matched_prefix_arr[b] + block_size - 1) // block_size for b in range(B)))
     key_cache = torch.zeros(num_cache_blocks, block_size, kv_heads, D, dtype=torch.bfloat16, device="cpu")
     value_cache = torch.zeros(num_cache_blocks, block_size, kv_heads, D, dtype=torch.bfloat16, device="cpu")
 
@@ -787,7 +850,7 @@ def test(
                 key_cache[physical_block, block_offset, :, :] = k_list_full[b][p, :, :]
                 value_cache[physical_block, block_offset, :, :] = v_list_full[b][p, :, :]
 
-    max_blocks_per_request = max(len(bt) for bt in block_table_arr)
+    max_blocks_per_request = max(1, max(len(bt) for bt in block_table_arr))
     block_table_tensor = torch.zeros(B, max_blocks_per_request, dtype=torch.int32, device="cpu")
     for b in range(B):
         for lb in range(len(block_table_arr[b])):
@@ -797,6 +860,12 @@ def test(
     segment_rules_i32 = torch.tensor(rules, dtype=torch.int32, device="cpu")
     q_seq_starts_i32 = torch.tensor(q_seq_starts_arr, dtype=torch.int32, device="cpu")
     matched_prefix_lens_i32 = torch.tensor(matched_prefix_arr, dtype=torch.int32, device="cpu")
+
+    live_offsets_list = []
+    for b in range(B):
+        prefix_len = matched_prefix_arr[b]
+        live_offsets_list.append([max(0, o - prefix_len) for o in offsets_list[b]])
+    segment_offsets_live_i32 = torch.tensor(live_offsets_list, dtype=torch.int32, device="cpu")
 
     sm_scale = 1.0 / math.sqrt(D)
 
@@ -811,6 +880,11 @@ def test(
         segment_rules_i32,
         q_seq_starts_i32,
         sm_scale,
+        num_blocks=num_cache_blocks,
+        key_cache=key_cache.npu(),
+        value_cache=value_cache.npu(),
+        block_table_i32=block_table_tensor.npu(),
+        matched_prefix_lens_i32=matched_prefix_lens_i32.npu(),
         block_M=block_M,
         block_N=block_N,
         core_num=core_num,
@@ -856,6 +930,26 @@ if __name__ == "__main__":
             ],
             "rules": [1, 0, 2],
             "matched_prefix_arr": [0, 0, 0, 0, 0, 0, 0, 0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [
+                [2200, 200, 1024],
+                [1700, 300, 1100],
+            ],
+            "rules": [1, 0, 2],
+            "matched_prefix_arr": [0, 0],
+        },
+        {
+            "H": 8,
+            "D": 128,
+            "seg_lengths": [
+                [2200, 200, 1024],
+                [1700, 300, 1100],
+            ],
+            "rules": [1, 0, 2],
+            "matched_prefix_arr": [128, 256],
         },
     ]
 
