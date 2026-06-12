@@ -9,6 +9,7 @@ from tilelang.intrinsics import make_zn_layout, make_nz_layout
 # 初始化环境
 torch.manual_seed(0)
 tilelang.disable_cache()
+tilelang.cache.clear_cache()
 
 # ---------------------------------------------------------------------------
 # 常量与优化 Pass 配置
@@ -104,9 +105,14 @@ def high_perf_mtgr_sparse_attn_kernel(
                 }
             )
 
-            l0a = T.alloc_L0A([2, block_M, dim], dtype)
-            l0b = T.alloc_L0B([2, dim, block_N], dtype)
-            l0c = T.alloc_L0C([2, block_M, block_N], accum_dtype)
+            l0a_s = T.alloc_L0A([2, block_M, dim], dtype)
+            l0b_s = T.alloc_L0B([2, dim, block_N], dtype)
+            l0c_s = T.alloc_L0C([2, block_M, block_N], accum_dtype)
+
+            l0a_o = T.alloc_L0A([2, block_M, block_N], dtype)
+            l0b_o = T.alloc_L0B([2, block_N, dim], dtype)
+            l0c_o_0 = T.alloc_L0C([block_M, dim], accum_dtype)
+            l0c_o_1 = T.alloc_L0C([block_M, dim], accum_dtype)
 
             acc_o = T.alloc_ub([half_M, dim], accum_dtype)
             r_factors = T.alloc_ub([num_stages, half_M, 1], accum_dtype)
@@ -119,8 +125,44 @@ def high_perf_mtgr_sparse_attn_kernel(
             work_ub = T.alloc_ub([half_M, block_N], accum_dtype)
             buf_2d = T.alloc_ub([half_M, block_N], accum_dtype)
 
+            bcast_buf = T.alloc_ub([half_M, dim], accum_dtype)
+            o_io_buf = T.alloc_ub([half_M, dim], dtype)
+            o_work_buf = T.alloc_ub([half_M, dim], accum_dtype)
+            o_acc_half = T.alloc_ub([half_M, dim], dtype)
+
             # 用于存储平铺流水线的真实有效 k 索引
             valid_k_indices = T.alloc_ub([max_splits], "int32")
+
+            T.annotate_address({
+                l0a_s: 0,
+                l0a_o: 0,
+
+                l0b_s: 0,
+                l0b_o: 0,
+
+                l0c_s: 0,
+                l0c_o_0: 0,
+                l0c_o_1: block_M * block_N * 4,
+
+                acc_o: 0,
+                r_factors: half_M * dim * 4,
+                sumexp_is: half_M * dim * 4 + num_stages * half_M * 4,
+                sumexp: half_M * dim * 4 + num_stages * half_M * 4 * 2,
+                neg_sm: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 4,
+
+                io_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12,
+                o_io_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12,
+
+                acc_s_half: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 2,
+                o_acc_half: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 2,
+
+                work_ub: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 4,
+                o_work_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 4,
+
+                buf_2d: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 8,
+                bcast_buf: half_M * dim * 4 + num_stages * half_M * 4 * 2 + half_M * 12 + half_M * block_N * 8,
+            })
+
             b_i = T.alloc_var("int32", init=0)
             seg_id = T.alloc_var("int32", init=0)
             next_seg_first_tile = T.alloc_var("int32", init=0)
@@ -247,21 +289,21 @@ def high_perf_mtgr_sparse_attn_kernel(
 
                             T.wait_flag("M", "MTE1", SIG_L0AB + side)
                             if i < 2:
-                                T.copy(q_l1, l0a[side, :, :])
+                                T.copy(q_l1, l0a_s[side, :, :])
 
                             T.wait_flag("MTE2", "MTE1", SIG_K_L1)
-                            T.copy(k_l1, l0b[side, :, :], transpose=True)
+                            T.copy(k_l1, l0b_s[side, :, :], transpose=True)
                             T.set_flag("MTE1", "MTE2", SIG_K_L1)
                             T.set_flag("MTE1", "M", SIG_L0AB + side)
 
                             T.wait_flag("MTE1", "M", SIG_L0AB + side)
                             T.wait_flag("FIX", "M", SIG_L0C + side)
-                            T.mma(l0a[side, :, :], l0b[side, :, :], l0c[side, :, :], init=True)
+                            T.mma(l0a_s[side, :, :], l0b_s[side, :, :], l0c_s[side, :, :], init=True)
                             T.set_flag("M", "MTE1", SIG_L0AB + side)
                             T.set_flag("M", "FIX", SIG_L0C + side)
 
                             T.wait_flag("M", "FIX", SIG_L0C + side)
-                            T.copy(l0c[side, :, :], workspace_1[cid, i, :, :])
+                            T.copy(l0c_s[side, :, :], workspace_1[cid, i, :, :])
                             T.set_flag("FIX", "M", SIG_L0C + side)
 
                             if (i + 1) % cross_interval == 0 or i == batch_iters - 1:
@@ -314,22 +356,28 @@ def high_perf_mtgr_sparse_attn_kernel(
 
                             T.wait_flag("MTE2", "MTE1", SIG_V_L1)
                             T.wait_flag("M", "MTE1", SIG_L0AB + side)
-                            T.copy(v_l1, l0b[side, :, :])
+                            T.copy(v_l1, l0b_o[side, :, :])
                             T.set_flag("MTE1", "MTE2", SIG_V_L1)
 
                             T.wait_flag("MTE2", "MTE1", SIG_P_L1)
-                            T.copy(p_l1, l0a[side, :, :])
+                            T.copy(p_l1, l0a_o[side, :, :])
                             T.set_flag("MTE1", "MTE2", SIG_P_L1)
                             T.set_flag("MTE1", "M", SIG_L0AB + side)
 
                             T.wait_flag("MTE1", "M", SIG_L0AB + side)
                             T.wait_flag("FIX", "M", SIG_L0C + side)
-                            T.mma(l0a[side, :, :], l0b[side, :, :], l0c[side, :, :], init=True)
+                            if side == 0:
+                                T.mma(l0a_o[side, :, :], l0b_o[side, :, :], l0c_o_0[:, :], init=True)
+                            else:
+                                T.mma(l0a_o[side, :, :], l0b_o[side, :, :], l0c_o_1[:, :], init=True)
                             T.set_flag("M", "MTE1", SIG_L0AB + side)
                             T.set_flag("M", "FIX", SIG_L0C + side)
 
                             T.wait_flag("M", "FIX", SIG_L0C + side)
-                            T.copy(l0c[side, :, :], workspace_3[cid, i, :, :])
+                            if side == 0:
+                                T.copy(l0c_o_0[:, :], workspace_3[cid, i, :, :])
+                            else:
+                                T.copy(l0c_o_1[:, :], workspace_3[cid, i, :, :])
                             T.set_flag("FIX", "M", SIG_L0C + side)
 
                             if (i + 1) % cross_interval == 0 or i == batch_iters - 1:
@@ -499,23 +547,23 @@ def high_perf_mtgr_sparse_attn_kernel(
                             T.wait_flag("V", "MTE2", SIG_IO_UB)
                             if i % cross_interval == 0:
                                 T.wait_cross_flag(SEM_WS3_C2V)
-                            T.copy(workspace_3[cid, i, vid * half_M : vid * half_M + half_M, :], io_buf[:, 0:dim])
+                            T.copy(workspace_3[cid, i, vid * half_M : vid * half_M + half_M, :], o_io_buf)
                             T.set_flag("MTE2", "V", SIG_IO_UB)
 
                             T.wait_flag("MTE2", "V", SIG_IO_UB)
-                            T.copy(io_buf[:, 0:dim], work_ub[:, 0:dim])
+                            T.copy(o_io_buf, o_work_buf)
                             T.set_flag("V", "MTE2", SIG_IO_UB)
 
-                            T.tile.add(acc_o, acc_o, work_ub[:, 0:dim])
+                            T.tile.add(acc_o, acc_o, o_work_buf)
 
                         T.set_cross_flag("MTE2", SEM_WS3_V2C)
 
                     # 最终输出标准化
                     T.tile.max(sumexp, sumexp, 1.0)
-                    T.tile.broadcast(buf_2d[:, 0:dim], sumexp)
-                    T.tile.div(acc_o, acc_o, buf_2d[:, 0:dim])
+                    T.tile.broadcast(bcast_buf, sumexp)
+                    T.tile.div(acc_o, acc_o, bcast_buf)
 
-                    T.copy(acc_o, acc_s_half[:, 0:dim])
+                    T.copy(acc_o, o_acc_half)
                     T.barrier_all()
 
                     # 收尾与拷贝回 GM (支持不规则最后一块裁减)
@@ -528,7 +576,7 @@ def high_perf_mtgr_sparse_attn_kernel(
                     h_i_out = (cid + core_index * core_num) % heads
                     output_packed_start = q_packed_start + vid * half_M
 
-                    T.copy(acc_s_half[0:valid_rows, 0:dim], Output[output_packed_start : output_packed_start + valid_rows, h_i_out, :])
+                    T.copy(o_acc_half[0:valid_rows, :], Output[output_packed_start : output_packed_start + valid_rows, h_i_out, :])
 
                 T.wait_flag("V", "MTE2", SIG_IO_UB)
                 T.wait_flag("MTE3", "V", SIG_S_HALF)
